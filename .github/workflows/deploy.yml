@@ -20,4 +20,3 @@ jobs:
           template: ./main.bicep
           parameters: objectId=b1d974c0-a2a6-4f45-a112-6c7facea553f
           failOnStdErr: false
-

@@ -1,69 +1,99 @@
-// main.bicep
+targetScope = 'resourceGroup'
 
-@description('Location for the storage account.')
+// ──────────────────────────────────────────────
+// Parameters
+// ──────────────────────────────────────────────
+
+@description('Environment name used as prefix/suffix for all resources (e.g. dev, staging, prod).')
+param environmentName string
+
+@description('Azure region for all resources.')
 param location string = resourceGroup().location
 
-@description('Unique name for the storage account.')
-@minLength(3)
-@maxLength(24)
-param storageName string = 'stg${uniqueString(resourceGroup().id)}'
+@description('Optional: AAD object ID of a human admin for Key Vault Secrets Officer access.')
+param adminObjectId string = ''
 
-@description('Name of key vault')
-param keyVaultName string = 'kv-${uniqueString(resourceGroup().id)}'
+// ──────────────────────────────────────────────
+// Derived resource names
+// ──────────────────────────────────────────────
 
-param objectId string
+var suffix = uniqueString(resourceGroup().id)
+var storageName = take('st${replace(environmentName, '-', '')}${suffix}', 24)
+var keyVaultName = take('kv-${environmentName}-${suffix}', 24)
+var acrName = take('acr${replace(environmentName, '-', '')}${suffix}', 50)
+var containerAppName = 'ca-${environmentName}'
 
-// ---storage account---
-resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
-  name: storageName
-  location: location
-  kind: 'StorageV2'
-  sku: {
-    name: 'Standard_LRS'
-  }
-  properties: {
-    minimumTlsVersion: 'TLS1_2'
-    supportsHttpsTrafficOnly: true
-    allowBlobPublicAccess: false
-  }
-}
+// ──────────────────────────────────────────────
+// Modules — independent (deploy in parallel)
+// ──────────────────────────────────────────────
 
-// ---key vault---
-resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' ={
-  name: keyVaultName
-  location: location
-  properties: {
-    tenantId: subscription().tenantId
-    sku: {
-      family: 'A'
-      name: 'standard'
-    }
-    accessPolicies: [
-      {
-        tenantId: subscription().tenantId
-        objectId: objectId
-        permissions: {
-          secrets: [
-            'get'
-            'list'
-            'set'
-          ]
-        }
-      }
-    ]
+module logAnalytics 'modules/log-analytics.bicep' = {
+  name: 'logAnalytics'
+  params: {
+    location: location
+    environmentName: environmentName
   }
 }
 
-// ---store the storage key as a secret in the key vault---
-resource storageSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
-  name: 'storageAccountKey'
-  properties: {
-    value: storageAccount.listKeys().keys[0].value
+module storage 'modules/storage.bicep' = {
+  name: 'storage'
+  params: {
+    location: location
+    storageName: storageName
   }
 }
 
+module acr 'modules/container-registry.bicep' = {
+  name: 'acr'
+  params: {
+    location: location
+    acrName: acrName
+  }
+}
 
-output storageAccountName string = storageAccount.name
-output keyVaultName string = keyVault.name
-output secretName string = storageSecret.name
+// ──────────────────────────────────────────────
+// Modules — dependent on log-analytics
+// ──────────────────────────────────────────────
+
+module containerApps 'modules/container-apps.bicep' = {
+  name: 'containerApps'
+  params: {
+    location: location
+    environmentName: environmentName
+    containerAppName: containerAppName
+    logAnalyticsCustomerId: logAnalytics.outputs.workspaceCustomerId
+    logAnalyticsSharedKey: logAnalytics.outputs.workspaceSharedKey
+  }
+}
+
+// ──────────────────────────────────────────────
+// Modules — dependent on container-apps / storage
+// ──────────────────────────────────────────────
+
+module keyVault 'modules/key-vault.bicep' = {
+  name: 'keyVault'
+  params: {
+    location: location
+    keyVaultName: keyVaultName
+    containerAppPrincipalId: containerApps.outputs.containerAppPrincipalId
+    storageAccountKey: storage.outputs.storageAccountKey
+    adminObjectId: adminObjectId
+  }
+}
+
+module monitoring 'modules/monitoring.bicep' = {
+  name: 'monitoring'
+  params: {
+    containerAppId: containerApps.outputs.containerAppId
+    containerAppName: containerAppName
+  }
+}
+
+// ──────────────────────────────────────────────
+// Outputs
+// ──────────────────────────────────────────────
+
+output acrLoginServer string = acr.outputs.acrLoginServer
+output containerAppUrl string = containerApps.outputs.containerAppUrl
+output keyVaultName string = keyVault.outputs.keyVaultName
+output storageAccountName string = storage.outputs.storageAccountName

@@ -1,22 +1,95 @@
-on: [workflow_dispatch]
-name: Deploy Bicep
+# =============================================================================
+# Required GitHub repository secrets (Settings → Secrets and variables → Actions):
+#
+#   AZURE_CLIENT_ID        – App (client) ID of the Entra ID app registration
+#                            used for OIDC federated login. No client secret needed.
+#
+#   AZURE_TENANT_ID        – Directory (tenant) ID of your Entra ID tenant.
+#
+#   AZURE_SUBSCRIPTION_ID  – The Azure subscription ID to deploy into.
+#
+#   AZURE_RG               – Name of the resource group (must already exist).
+#
+# OIDC setup (one-time):
+#   1. Create an Entra ID app registration (or reuse an existing one).
+#   2. Under "Certificates & secrets → Federated credentials", add two credentials:
+#      a. Entity type: Branch  – repo: <owner>/testing_bicep_deployments, branch: main
+#      b. Entity type: Pull request – repo: <owner>/testing_bicep_deployments
+#   3. Grant the app registration Contributor + RBAC Admin on the target resource group.
+#   4. Store the four values above as GitHub Actions secrets.
+# =============================================================================
+
+name: Validate & Deploy Bicep
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ENVIRONMENT_NAME: dev
+  TEMPLATE_FILE: ./main.bicep
 
 jobs:
-  deploy:
+  # ── PR gate: validate only, no deploy ──────────────────────────────────────
+  validate:
+    name: Validate Bicep
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: azure/login@v1
+      - name: Build Bicep (syntax + linter)
+        run: az bicep build --file ${{ env.TEMPLATE_FILE }}
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Preflight validation (what-if)
+        run: |
+          az deployment group validate \
+            --resource-group ${{ secrets.AZURE_RG }} \
+            --template-file ${{ env.TEMPLATE_FILE }} \
+            --parameters environmentName=${{ env.ENVIRONMENT_NAME }}
+
+  # ── Deploy on push to main ─────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Azure
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Deploy Bicep
-        uses: azure/arm-deploy@v2
-        with:
-          scope: resourcegroup  
-          subscriptionId: ${{ secrets.AZURE_SUBSCRIPTION }}
-          resourceGroupName: ${{ secrets.AZURE_RG }}
-          template: ./main.bicep
-          parameters: objectId=b1d974c0-a2a6-4f45-a112-6c7facea553f
-          failOnStdErr: false
+        id: deploy
+        run: |
+          result=$(az deployment group create \
+            --resource-group ${{ secrets.AZURE_RG }} \
+            --template-file ${{ env.TEMPLATE_FILE }} \
+            --parameters environmentName=${{ env.ENVIRONMENT_NAME }} \
+            --query 'properties.outputs' \
+            --output json)
+
+          echo "$result" | jq .
+
+          app_url=$(echo "$result" | jq -r '.containerAppUrl.value')
+          echo "container_app_url=$app_url" >> "$GITHUB_OUTPUT"
+
+      - name: Print Container App URL
+        run: echo "🚀 Container App deployed at ${{ steps.deploy.outputs.container_app_url }}"
